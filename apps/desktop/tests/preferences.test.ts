@@ -15,7 +15,7 @@ import { readAppPreferences, writeAppPreference } from '../src/main/preferences'
 const profile = () => mkdtempSync(join(tmpdir(), 'althar-preferences-'))
 
 describe('the app’s preferences kept in the profile', () => {
-  it('start awake while plugged in, every notification on, the count on, silent with no sound to go back to, the first editor found, the load in the bar, usage data and crash reports on, light or dark as the system is, and not opening at login', async () => {
+  it('start awake while plugged in, every notification on, the count on, silent with no sound to go back to, the first editor found, the load in the bar, usage data and crash reports on, light or dark as the system is, not opening at login, thread links opening beside the conversation, and pages keeping cookies until their task is done', async () => {
     expect(await readAppPreferences(profile())).toEqual({
       keepAwake: true,
       awakeOnBattery: false,
@@ -30,8 +30,17 @@ describe('the app’s preferences kept in the profile', () => {
       usageData: true,
       crashReports: true,
       appearance: 'light',
+      accent: 'althar',
       openAtLogin: false,
+      browserLinks: 'beside',
+      browserCookies: 'task',
     })
+  })
+
+  it('hold the accent’s two sources, and nothing else', () => {
+    expect(holds('accent', 'system')).toBe(true)
+    expect(holds('accent', 'althar')).toBe(true)
+    expect(holds('accent', '#3584e4')).toBe(false)
   })
 
   it('hold light, dark or the system’s for the appearance, and nothing else', () => {

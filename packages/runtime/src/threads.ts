@@ -1,6 +1,16 @@
+import { realpathSync } from 'node:fs'
+import { relative } from 'node:path'
+
 import { Ids, newId, type ProjectId, type ThreadItemKind } from '@althar/domain'
 import { Ledger } from '@althar/persistence-sqlite'
-import { answerWords, type FieldAnswer, type Handed, type QuestionField, type SessionEvent } from '@althar/provider-adapters'
+import {
+  answerWords,
+  type FieldAnswer,
+  type Handed,
+  type QuestionField,
+  type SeenSkill,
+  type SessionEvent,
+} from '@althar/provider-adapters'
 import { Cause, Clock, Duration, Effect, Exit, Fiber, Scope, Semaphore } from 'effect'
 import { SqlClient } from 'effect/sql'
 
@@ -42,6 +52,8 @@ export interface ItemPlace {
   readonly folders?: ReadonlyArray<string>
   /** A sandbox holds its shell commands (ADR-071): what one says it couldn't do there, the sandbox refused. */
   readonly sandboxed?: boolean
+  /** A task's lead, by its agent's name: the thread says which skills it could see. */
+  readonly lead?: string
 }
 
 /** Adds an item at the end of the thread. */
@@ -119,6 +131,98 @@ export const toolItem = (sessionId: string, toolCallId: string) =>
     return row === undefined ? undefined : { id: row.id, content: JSON.parse(row.content) as Record<string, unknown> }
   })
 
+/** Whether a path is inside a folder: the folder itself isn't. */
+const inside = (path: string, folder: string) => path.startsWith(`${folder}/`) || path.startsWith(`${folder}\\`)
+
+/** The folders an agent works in, each also as its real path, which is how an agent may say one under it (`/home` a link to `/var/home`). */
+const spelledBoth = (folders: ReadonlyArray<string> = []) =>
+  folders.flatMap((folder) => {
+    try {
+      return [folder, realpathSync(folder)]
+    } catch {
+      return [folder]
+    }
+  })
+
+/** The line the thread last said what a lead could see in: its session too, as a later session's may say the same. */
+const skillsLine = (threadId: string) =>
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient
+    const [row] = yield* sql<{ id: string; content: string; providerSessionId: string | null }>`
+      SELECT id, content, provider_session_id FROM thread_items
+      WHERE thread_id = ${threadId} AND kind = 'notice' AND json_extract(content, '$.role') = 'skills'
+      ORDER BY sequence DESC LIMIT 1`
+    if (row === undefined) return undefined
+    const content = JSON.parse(row.content) as { readonly title: string; readonly skills: ReadonlyArray<ShownSkill> }
+    return { id: row.id, sessionId: row.providerSessionId, content }
+  })
+
+interface ShownSkill extends SeenSkill {
+  readonly from: 'person' | 'repository'
+}
+
+/**
+ * Keeps on the session what its agent could see, as a line of the thread: one
+ * a session changes as it hears more, and no new one for a session that
+ * could see just what the last one could, as each restart starts another.
+ */
+const sawSkills = (place: ItemPlace & { readonly lead: string }, skills: ReadonlyArray<SeenSkill>) =>
+  Effect.gen(function* () {
+    const worksIn = spelledBoth(place.folders)
+    const shown: ReadonlyArray<ShownSkill> = skills
+      .map((skill) => ({
+        ...skill,
+        from: worksIn.some((folder) => inside(skill.path, folder)) ? ('repository' as const) : ('person' as const),
+      }))
+      .toSorted((a, b) => a.name.localeCompare(b.name))
+    const last = yield* skillsLine(place.threadId)
+    if (last === undefined && shown.length === 0) return
+    const title =
+      shown.length === 0
+        ? `${place.lead} could see no skills`
+        : `${place.lead} could see ${shown.length === 1 ? 'a skill' : `${shown.length} skills`}`
+    if (last !== undefined && last.content.title === title && JSON.stringify(last.content.skills) === JSON.stringify(shown)) return
+    const content = { source: 'runtime', severity: 'info', role: 'skills', title, skills: shown }
+    if (last !== undefined && last.sessionId === place.sessionId) yield* updateItem(place.projectId, last.id, content)
+    else yield* addItem(place, 'notice', content)
+  })
+
+/** Commands that print a file, for a shell command that reads a skill's `SKILL.md`. */
+const PRINTS = /\b(cat|sed|head|tail|less|more|bat|nl|awk)\b/
+
+/**
+ * The skills a finished call read the `SKILL.md` of, of those the thread says
+ * its agent could see: all Codex shows of using one (`skills.ts`). A file read,
+ * or a shell command that prints it: never one that only names it.
+ */
+const skillsRead = (place: ItemPlace, content: Readonly<Record<string, unknown>>) =>
+  Effect.gen(function* () {
+    if (content.status !== 'completed' || (content.kind !== 'read' && content.kind !== 'execute')) return []
+    const paths = Array.isArray(content.locations)
+      ? (content.locations as ReadonlyArray<{ readonly path?: unknown }>).flatMap((location) =>
+          typeof location.path === 'string' ? [location.path] : [],
+        )
+      : []
+    const command = content.kind === 'execute' ? (commandIn(content.rawInput) ?? '') : ''
+    if (!command.includes('SKILL.md') && !paths.some((path) => path.endsWith('SKILL.md'))) return []
+    const printing = command.split(/&&|\|\||;|\|/).filter((part) => PRINTS.test(part))
+    const line = yield* skillsLine(place.threadId)
+    return (line?.content.skills ?? []).flatMap((skill) => {
+      // From the repository too, as Windows spells it and with forward slashes, which agents' shells take there as well.
+      const spellings = [
+        skill.path,
+        ...spelledBoth(place.folders).flatMap((folder) => {
+          if (!inside(skill.path, folder)) return []
+          const from = relative(folder, skill.path)
+          return [...new Set([from, from.replaceAll('\\', '/')])]
+        }),
+      ]
+      return paths.some((path) => spellings.includes(path)) || printing.some((part) => spellings.some((one) => part.includes(one)))
+        ? [skill.name]
+        : []
+    })
+  })
+
 /** How often a message being streamed is written: every so many characters, or so many milliseconds. */
 const WRITE_EVERY_CHARACTERS = 2_000
 const WRITE_EVERY_MILLIS = 2_000
@@ -163,6 +267,8 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
         readonly id: string
         /** The id the agent gave this message, where it gives one. */
         messageId: string | undefined
+        /** It is the agent's answer, or a word on the way, where the agent says (Codex). */
+        answer: boolean | undefined
         text: string
         written: number
         writtenAt: number
@@ -178,6 +284,10 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
   const folders = place.folders ?? []
   const where = (itemId: string) => ({ projectId: place.projectId, itemId, folders })
 
+  /** What a message says, and whether it is the agent's answer where it says. */
+  const said = (open: { readonly text: string; readonly answer: boolean | undefined }) =>
+    open.answer === undefined ? { text: open.text } : { text: open.text, answer: open.answer }
+
   /**
    * Writes the message being gathered; its item was placed when its first chunk arrived.
    * It is let go once written, or failed; a write cut short by interruption leaves it
@@ -186,7 +296,7 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
   const flush = Effect.gen(function* () {
     const open = gathering
     if (open === undefined) return
-    yield* updateItem(place.projectId, open.id, withHanded({ text: open.text }, open.handed)).pipe(
+    yield* updateItem(place.projectId, open.id, withHanded(said(open), open.handed)).pipe(
       Effect.onExit((exit) =>
         Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)
           ? Effect.void
@@ -198,7 +308,7 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
   })
 
   /** The message being gathered, or a new one: what it hands back goes with its words. */
-  const gathered = (kind: 'agent_message' | 'agent_thought', text: string, messageId?: string) =>
+  const gathered = (kind: 'agent_message' | 'agent_thought', text: string, messageId?: string, answer?: boolean) =>
     Effect.gen(function* () {
       // A different kind, or a message id other than the open one's, starts a new item; without ids, chunks run on.
       if (
@@ -210,8 +320,9 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
       // The item is placed when its first chunk arrives, so the thread keeps the order things happened in.
       const open = {
         kind,
-        id: yield* addItem(place, kind, { text }),
+        id: yield* addItem(place, kind, said({ text, answer })),
         messageId,
+        answer,
         text,
         written: text.length,
         writtenAt: yield* Clock.currentTimeMillis,
@@ -221,16 +332,17 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
       return { open, fresh: true }
     })
 
-  const gather = (kind: 'agent_message' | 'agent_thought', text: string, messageId?: string) =>
+  const gather = (kind: 'agent_message' | 'agent_thought', text: string, messageId?: string, answer?: boolean) =>
     Effect.gen(function* () {
-      const { open, fresh } = yield* gathered(kind, text, messageId)
+      const { open, fresh } = yield* gathered(kind, text, messageId, answer)
       if (fresh) return
       if (open.messageId === undefined && messageId !== undefined) open.messageId = messageId
+      if (open.answer === undefined && answer !== undefined) open.answer = answer
       const now = yield* Clock.currentTimeMillis
       open.text += text
       // A long message is written as it grows, so a crash loses only its last few seconds.
       if (open.text.length - open.written >= WRITE_EVERY_CHARACTERS || now - open.writtenAt >= WRITE_EVERY_MILLIS) {
-        yield* updateItem(place.projectId, open.id, withHanded({ text: open.text }, open.handed))
+        yield* updateItem(place.projectId, open.id, withHanded(said(open), open.handed))
         open.written = open.text.length
         open.writtenAt = now
       }
@@ -243,7 +355,7 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
       const now = yield* handedNow(where(open.id), content)
       if (now.pictures.length === 0 && now.files.length === 0) return
       open.handed = together(open.handed, now)
-      yield* updateItem(place.projectId, open.id, withHanded({ text: open.text }, open.handed))
+      yield* updateItem(place.projectId, open.id, withHanded(said(open), open.handed))
       open.written = open.text.length
       open.writtenAt = yield* Clock.currentTimeMillis
     })
@@ -340,7 +452,7 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
   const record = (event: SessionEvent) => {
     switch (event._tag) {
       case 'AgentMessage':
-        return gather('agent_message', event.text, event.messageId)
+        return gather('agent_message', event.text, event.messageId, event.answer)
       case 'AgentThought':
         return gather('agent_thought', event.text)
       case 'AgentContent':
@@ -361,14 +473,24 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
           })
           const existing = yield* toolItem(place.sessionId, event.toolCallId)
           const cut = [...new Set([...cutOf(existing?.content), ...(kept?.cut ?? []), ...(output ? ['output'] : [])])]
-          const marked = cut.length === 0 ? content : { ...content, cut }
+          const marked = {
+            ...(cut.length === 0 ? content : { ...content, cut }),
+            ...(event.skill === undefined ? {} : { skill: { names: [event.skill], reported: true } }),
+          }
+          // Only what it read of the skills its agent listed: an agent that says what it loads has said so.
+          const read = (stored: Readonly<Record<string, unknown>>) =>
+            stored.skill === undefined
+              ? Effect.map(skillsRead(place, stored), (names) => (names.length === 0 ? {} : { skill: { names, reported: false } }))
+              : Effect.succeed({})
           if (existing === undefined) {
-            const stored = { title: '', kind: 'other', status: 'pending', ...marked }
+            const first = { title: '', kind: 'other', status: 'pending', ...marked }
+            const stored = { ...first, ...(yield* read(first)) }
             const id = yield* addItem(place, 'tool_call', stored, { toolCallId: event.toolCallId })
             const extras = yield* extrasOf(event.toolCallId, id, stored, event)
             if (extras !== undefined) yield* updateItem(place.projectId, id, { ...stored, ...extras })
           } else {
-            const stored = { ...existing.content, ...marked }
+            const merged = { ...existing.content, ...marked }
+            const stored = { ...merged, ...(yield* read(merged)) }
             const extras = yield* extrasOf(event.toolCallId, existing.id, stored, event)
             yield* updateItem(place.projectId, existing.id, { ...stored, ...extras })
           }
@@ -379,6 +501,8 @@ export const recorder = (place: ItemPlace & { readonly sessionId: string }) => {
           if (plan === undefined) plan = yield* addItem(place, 'plan', { entries: event.entries })
           else yield* updateItem(place.projectId, plan, { entries: event.entries })
         })
+      case 'SkillsSeen':
+        return place.lead === undefined ? Effect.void : Effect.andThen(flush, sawSkills({ ...place, lead: place.lead }, event.skills))
       case 'Notice':
         return notice({ source: 'agent', severity: event.severity, title: event.title, description: event.description })
       case 'AgentFailure':
@@ -544,6 +668,8 @@ export const transcript = (
           return [`[tool] ${text('title')} (${text('status')})${printed === null ? '' : `\n[it printed] ${printed.text}`}`]
         }
         case 'notice':
+          // What an agent could see is the person's to read: its own agent finds what it finds.
+          if (text('role') === 'skills') return []
           return [`[note] ${text('title')}${text('description') === '' ? '' : `: ${text('description')}`}`]
         // What the lead showed the person, by its captions: an agent that takes the thread over knows what they have seen.
         case 'pictures': {

@@ -5,6 +5,7 @@ import type { ToolKind } from '@althar/domain'
 
 import type { BackgroundEvent } from './background'
 import type { Classified } from './failures'
+import { type SeenSkill, skillLoadedBy, skillsAmong } from './skills'
 import { claudeRateLimitWindows, record, type UsageWindow } from './usage'
 
 /*
@@ -94,7 +95,16 @@ export interface TerminalReport {
 }
 
 export type SessionEvent =
-  | { readonly _tag: 'AgentMessage'; readonly text: string; readonly messageId?: string }
+  | {
+      readonly _tag: 'AgentMessage'
+      readonly text: string
+      readonly messageId?: string
+      /**
+       * Whether the message is the agent's answer, ending its turn, or a word on the way between its steps, where it says
+       * (`answerOf`); absent where it doesn't.
+       */
+      readonly answer?: boolean
+    }
   /** Something in a message that isn't words: a picture, or a file it points at. */
   | { readonly _tag: 'AgentContent'; readonly content: Handed; readonly messageId?: string }
   | { readonly _tag: 'AgentThought'; readonly text: string }
@@ -111,6 +121,8 @@ export type SessionEvent =
       readonly locations?: ReadonlyArray<ToolLocation>
       readonly content?: ReadonlyArray<ToolContent>
       readonly terminal?: TerminalReport
+      /** The skill it loads, where it says. */
+      readonly skill?: string
     }
   | {
       readonly _tag: 'ToolCallUpdate'
@@ -124,7 +136,10 @@ export type SessionEvent =
       /** What it holds now, whole: each update that has content says all of it again. */
       readonly content?: ReadonlyArray<ToolContent>
       readonly terminal?: TerminalReport
+      readonly skill?: string
     }
+  /** The skills it could see, as it says, whole each time (`skills.ts`). */
+  | { readonly _tag: 'SkillsSeen'; readonly skills: ReadonlyArray<SeenSkill> }
   | { readonly _tag: 'Plan'; readonly entries: ReadonlyArray<{ readonly content: string; readonly status: string }> }
   | {
       readonly _tag: 'ContextUsage'
@@ -158,7 +173,12 @@ export type SessionEvent =
   /** The adapter resumed a turn the agent stopped on a rejection, telling it why. */
   | { readonly _tag: 'Resumed'; readonly reason: string }
   /** The agent reported a failure in structured form, during a turn or between turns. */
-  | { readonly _tag: 'AgentFailure'; readonly severity: 'warning' | 'error'; readonly classified: Classified }
+  | {
+      readonly _tag: 'AgentFailure'
+      readonly severity: 'warning' | 'error'
+      readonly classified: Classified
+      readonly connectionLost?: true
+    }
   | { readonly _tag: 'Other'; readonly update: string; readonly raw: unknown }
   /** A command it left running started, said where its output goes, or ended (background.ts). */
   | BackgroundEvent
@@ -323,11 +343,23 @@ export const normalizeUsage = (usage: acp.Usage | null | undefined): TokenUsage 
         ...defined('cachedWriteTokens', usage.cachedWriteTokens),
       }
 
+/**
+ * Whether a message is the agent's answer: Codex says of each one whether it
+ * is its final answer or commentary on the way, and codex-acp passes that on
+ * to an AIR client, as Althar is, on each of its chunks from the first.
+ * Claude Code and OpenCode don't say.
+ */
+export const answerOf = (meta: unknown): boolean | undefined => {
+  const phase = recordOf(recordOf(recordOf(meta)?.jetbrains)?.air)?.phase
+  return phase === 'final_answer' ? true : phase === 'commentary' ? false : undefined
+}
+
 export const normalize = (update: acp.SessionUpdate): SessionEvent => {
   switch (update.sessionUpdate) {
     case 'agent_message_chunk': {
       const text = textOf(update.content)
-      if (text !== undefined) return { _tag: 'AgentMessage', text, ...defined('messageId', update.messageId) }
+      if (text !== undefined)
+        return { _tag: 'AgentMessage', text, ...defined('messageId', update.messageId), ...defined('answer', answerOf(update._meta)) }
       const handed = handedOf(update.content)
       return handed === undefined
         ? { _tag: 'Other', update: update.sessionUpdate, raw: update }
@@ -349,6 +381,7 @@ export const normalize = (update: acp.SessionUpdate): SessionEvent => {
         ...defined('locations', locationsOf(update.locations)),
         ...defined('content', toolContentOf(update.content)),
         ...defined('terminal', terminalOf(update._meta)),
+        ...defined('skill', skillLoadedBy(update)),
       }
     case 'tool_call_update':
       return {
@@ -361,6 +394,7 @@ export const normalize = (update: acp.SessionUpdate): SessionEvent => {
         ...defined('locations', locationsOf(update.locations)),
         ...defined('content', toolContentOf(update.content)),
         ...defined('terminal', terminalOf(update._meta)),
+        ...defined('skill', skillLoadedBy(update)),
       }
     case 'plan':
       return { _tag: 'Plan', entries: update.entries.map((entry) => ({ content: entry.content, status: entry.status })) }
@@ -386,10 +420,13 @@ export const normalize = (update: acp.SessionUpdate): SessionEvent => {
       return { _tag: 'ModeChanged', modeId: update.currentModeId, byAgent: true }
     case 'notice':
       return { _tag: 'Notice', severity: update.severity, title: update.title, ...defined('description', update.description) }
+    case 'available_commands_update': {
+      const skills = skillsAmong(update.availableCommands)
+      return skills === undefined ? { _tag: 'Other', update: update.sessionUpdate, raw: update } : { _tag: 'SkillsSeen', skills }
+    }
     case 'user_message_chunk':
     case 'plan_update':
     case 'plan_removed':
-    case 'available_commands_update':
     case 'session_info_update':
     case 'compaction_update':
     case 'compaction_summary_chunk':

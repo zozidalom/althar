@@ -4,7 +4,15 @@ import { homedir, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
 import { available, type Fetch, type Product, type ProductInfo } from '@althar/connectors'
-import { adapterNode, agents, type AgentDefinition, type SessionOptions, type Transport, usingLocated } from '@althar/provider-adapters'
+import {
+  adapterNode,
+  agents,
+  type AgentDefinition,
+  inFlatpakSandbox,
+  type SessionOptions,
+  type Transport,
+  usingLocated,
+} from '@althar/provider-adapters'
 import { Context, Crypto, type Duration, Effect, Layer } from 'effect'
 
 import type { Machine } from './atOnce'
@@ -88,6 +96,11 @@ export interface RuntimeOptions {
   readonly deviceName: string
   /** How long a proposed plan waits before it starts on its own: 25 seconds unless a test says otherwise. */
   readonly countdown?: Duration.Duration
+  /**
+   * How long a task the coordinator drafted, with no plan yet, stays off the board before it is the person's: five
+   * minutes unless a test says otherwise. Its turn ending without a plan brings it to the person sooner.
+   */
+  readonly drafting?: Duration.Duration
   /** How often a task's pull requests are asked for news while it listens: 30 seconds unless a test says otherwise. */
   readonly listenEvery?: Duration.Duration
   /** How often the merge line is swept, and whether at all (not with an infinite one): 30 seconds unless a test says otherwise (MergeLine.ts). */
@@ -214,6 +227,8 @@ export interface BusyOptions {
   readonly askGrace?: Duration.Duration
   /** How many automations' tasks may be at work at once: one. */
   readonly automations?: number
+  /** How many places beyond the number tasks planned small may take (quickLane.ts): one; none turns the quick lane off. */
+  readonly quick?: number
   /**
    * The CPU time of each process in the tree of each of these agents (the agent's process and everything it started), by
    * process and in milliseconds, by thread; null where it can't be said, as for an agent that is no process of its own:
@@ -334,7 +349,13 @@ export class Agents extends Context.Service<
           definition,
           transport: (cwd: string, env: Readonly<Record<string, string>> = {}, options: SessionOptions = {}) => {
             const spec = definition.launch(adapterNode())
-            const own = definition.withoutOwnTools?.({ env: { ...process.env, ...env }, homeDir: homedir(), cwd }) ?? {}
+            const own =
+              definition.withoutOwnTools?.({
+                env: { ...process.env, ...env },
+                homeDir: homedir(),
+                cwd,
+                inSandbox: inFlatpakSandbox(spec),
+              }) ?? {}
             const held = options.untrusted === true ? { ...readingUntrusted, ...definition.reviewing?.env?.({ ...spec.env, ...own }) } : {}
             // The run's skills, where the agent finds them through its environment: what it would have, with the folder added.
             const via = definition.skills?.via

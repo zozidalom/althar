@@ -141,6 +141,17 @@ export const OnlyHome: Story = { args: { initial: [], current: null } }
 export const EveryProjectOpen: Story = { args: { initial: ALL } }
 /** In the app the system draws the lights; the bar keeps their space. */
 export const NativeLights: Story = { args: { lights: 'space' } }
+/** On GNOME: its buttons at the bar's end, close alone, as GNOME has it out of the box (ADR-098). */
+export const OnGnome: Story = { args: { controls: { look: 'gnome', tone: 'adwaita', start: [], end: ['close'] } } }
+/** On GNOME, in the dark, with minimize and maximize as the person's button-layout asks. */
+export const OnGnomeDark: Story = {
+  args: { controls: { look: 'gnome', tone: 'adwaita', start: [], end: ['minimize', 'maximize', 'close'] } },
+  globals: { theme: 'dark' },
+}
+/** On Windows: caption buttons at the bar's end, its full height. */
+export const OnWindows: Story = { args: { controls: { look: 'windows', start: [], end: ['minimize', 'maximize', 'close'] } } }
+/** Where KWin, xfwm4 or Marco draws the frame, or a tiling compositor none: the bar draws no buttons. */
+export const UnderTheSystemFrame: Story = { args: { lights: 'none' } }
 
 export const SwitchingOpeningAndClosing: Story = {
   play: async ({ canvasElement }) => {
@@ -230,6 +241,21 @@ export const WithSettings: Story = {
     await expect(nav.queryByRole('button', { name: 'Settings' })).toBeNull()
   },
 }
+
+/** A page in a tab of its own, after the projects': named by its title, with the window while it is pressed; its × closes it. */
+export const WithAPage: Story = {
+  args: {
+    current: null,
+    pages: [{ id: 'task_refunds', title: 'Refunds · Acme', current: true, onSelect: fn(), onClose: fn() }],
+  },
+  play: async ({ canvasElement }) => {
+    const nav = within(within(canvasElement).getByRole('navigation', { name: 'Projects' }))
+    const pages = within(nav.getByRole('list', { name: 'Pages' }))
+    await expect(pages.getByRole('button', { name: 'Refunds · Acme' })).toHaveAttribute('aria-current', 'page')
+    await expect(nav.getByRole('button', { name: /^Home/ })).not.toHaveAttribute('aria-current')
+  },
+}
+export const WithAPageDark: Story = { ...WithAPage, globals: { theme: 'dark' } }
 
 /** With another project to open, New project is the + menu's last item; with none, the + starts one at once. */
 export const StartingANewProject: Story = {

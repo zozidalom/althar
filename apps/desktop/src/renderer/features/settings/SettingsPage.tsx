@@ -4,6 +4,7 @@ import { type AgentStatus, MOST_AT_ONCE } from '@althar/contracts'
 import {
   AgentInstall,
   AgentsAtOnce,
+  BrowserPreferences,
   type AgentTab,
   AgentTabList,
   AgentTabPanel,
@@ -45,11 +46,12 @@ import {
 } from '@althar/ui'
 
 import altharFace from '../../../../resources/faces/althar-ai.svg'
-import type { Appearance } from '../../../main/appPreferences'
+import type { AccentSource, Appearance } from '../../../main/appPreferences'
 import { SYSTEM_SOUND } from '../../../main/notify'
 import { notesOf } from '../../../main/updates'
 import { useServices } from '../../data/services'
 import { agentLineOf, brandOf, pinnedOf } from '../../shared/agents'
+import { systemAccentState } from '../../shared/accent'
 import { appIcons } from '../../shared/appIcons'
 import { device, platform } from '../../shared/device'
 import { choosing, edgePlaces, edgeWords } from '../../shared/edge'
@@ -57,6 +59,7 @@ import { useEditorList, useEditorPictures } from '../../shared/OpenIn'
 import { type PreferencesModel, usePreferences } from '../../shared/usePreferences'
 import { useSounds } from '../../shared/useSounds'
 import { useUpdate } from '../../shared/useUpdate'
+import { useDesktopChrome } from '../../shared/useWindowChrome'
 import { AgentAccounts } from '../accounts/AgentAccounts'
 import { type AccountSignInModel, useAccountSignIn } from '../accounts/useAccountSignIn'
 import { ConnectionsView } from '../connections/ConnectionsView'
@@ -66,6 +69,7 @@ import type { StartModel } from '../start/useStart'
 import { EXAMPLE, IslandPicture, MenuPicture, shownGlance } from './EdgePicture'
 import { ModelsView } from './ModelsView'
 import { QuickCards } from './QuickCards'
+import { ChangedBy } from './ChangedBy'
 import { GROUPS, type Section, sectionText } from './sections'
 import s from './Settings.module.css'
 import { text } from './text'
@@ -166,6 +170,7 @@ export function SettingsPage({ start, section, onSection, onTask, signIn }: Sett
         </>
       }
     >
+      <ChangedBy projectId={null} section={`althar/${section}`} />
       <SectionBody
         section={section}
         start={start}
@@ -224,6 +229,8 @@ function SectionBody({
       return <AppearanceSection {...looks} />
     case 'editor':
       return <EditorSection />
+    case 'browser':
+      return <BrowserSection />
     case 'about':
       return <AboutSection start={start} />
   }
@@ -574,6 +581,8 @@ function AppearanceSection({ appIcon, edge }: Looks) {
   const { spot } = edge
   const words = spot === null ? null : edgeWords(spot)
   const { preferences, set, failed } = usePreferences()
+  const { host } = useServices()
+  const accent = systemAccentState(useDesktopChrome(host)?.accent)
   return (
     <>
       <SettingList>
@@ -587,6 +596,25 @@ function AppearanceSection({ appIcon, edge }: Looks) {
                 { value: 'light', label: text.themeLight },
                 { value: 'dark', label: text.themeDark },
                 { value: 'system', label: text.themeSystem },
+              ]}
+            />
+          )}
+        </SettingRow>
+        <SettingRow
+          title={text.accent}
+          {...(preferences.accent === 'system' && accent !== 'used'
+            ? { note: accent === 'none' ? text.accentNone : text.accentIllegible }
+            : {})}
+          glyph={<Icon name="theme" size={15} />}
+        >
+          {() => (
+            <Segmented<AccentSource>
+              label={text.accent}
+              value={preferences.accent}
+              onChange={(source) => set('accent', source)}
+              options={[
+                { value: 'althar', label: text.accentAlthar },
+                { value: 'system', label: text.accentSystem },
               ]}
             />
           )}
@@ -676,6 +704,39 @@ function EditorSection() {
         }))}
         value={editors.find((editor) => editor.id === preferences.editor)?.id ?? editors[0]?.id ?? null}
         onChange={(editor) => set('editor', editor)}
+      />
+      <Failed when={failed} />
+    </>
+  )
+}
+
+/* ---- the browser ------------------------------------------------------------------ */
+
+/**
+ * The pages beside conversations (ADR-100): where a thread's links open, how
+ * long pages keep cookies, and clearing what every page kept, at once.
+ */
+function BrowserSection() {
+  const { preferences, set, failed } = usePreferences()
+  const pages = useServices().host.pages
+  const [clearing, setClearing] = useState<'no' | 'clearing' | 'cleared'>('no')
+  return (
+    <>
+      <BrowserPreferences
+        links={preferences.browserLinks}
+        onLinks={(links) => set('browserLinks', links)}
+        keep={preferences.browserCookies}
+        onKeep={(keep) => set('browserCookies', keep)}
+        onClear={() => {
+          if (pages === undefined) return
+          setClearing('clearing')
+          void pages.clearAll().then(
+            () => setClearing('cleared'),
+            () => setClearing('no'),
+          )
+        }}
+        clearing={clearing === 'clearing'}
+        cleared={clearing === 'cleared'}
       />
       <Failed when={failed} />
     </>

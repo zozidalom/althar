@@ -19,12 +19,13 @@ import { messageOf, type StuckAnswer } from '../../data/client'
 import { useMerge } from '../../data/merges'
 import { keys, reads } from '../../data/reads'
 import { canPick } from '../../shared/agents'
-import { caughtUp, isSending, mergeItems, newestReads, sending, takenBack, unsent, waiting } from '../../shared/items'
+import { isSending, mergeItems, newestReads, sending, takenBack, unsent, waiting } from '../../shared/items'
 import { headsOf } from '../../shared/mergeHere'
 import { type Choice, moveTo, runningOn, startOf } from '../../shared/models'
 import type { OutputSoFar } from '../../shared/handed'
 import { type Outgoing, sentWith } from '../../shared/useAttachments'
 import { useOutputs } from '../../shared/useOutputs'
+import { useStreamed } from '../../shared/useStreamed'
 import type { Streamed } from '../../shared/thread'
 import { useServices, useWatch } from '../../data/services'
 
@@ -85,6 +86,10 @@ export interface TaskModel {
   readonly dismissConflict: () => void
   /** The pull request a push was refused by for commits on it that aren't on the branch, by its address; null otherwise. */
   readonly refused: string | null
+  /** Of its pull requests being accepted in turn, the one merging now, by its address; null otherwise. */
+  readonly merging: string | null
+  /** The pull request whose merge the error is about, by its address, so its card says why there; null otherwise. */
+  readonly mergeRefused: string | null
   /** An action is on its way to the runtime. */
   readonly pending: boolean
   /** Which of them, where it is one of the outputs' (see `doing`): the others wait, but aren't working. */
@@ -251,7 +256,8 @@ export const useTask = (threadId: string): TaskModel => {
   const snapshot = thread.data ?? null
   const status = useQuery(read.status()).data
   const agents = useMemo(() => status?.agents.filter(canPick) ?? [], [status])
-  const [streaming, setStreaming] = useState<ReadonlyMap<string, Streamed>>(new Map())
+  // What its lead is still saying, while the window hears it.
+  const streaming = useStreamed(threadId, snapshot?.items ?? NO_ITEMS)
   // What its commands have printed so far, while they run.
   const outputs = useOutputs(threadId, snapshot?.items ?? NO_ITEMS, snapshot?.session?.turnRunning ?? false)
   const [failed, setError] = useState<string | null>(null)
@@ -260,6 +266,8 @@ export const useTask = (threadId: string): TaskModel => {
   const [acting, setActing] = useState<Doing | null>(null)
   const [conflict, setConflict] = useState<string | null>(null)
   const [refused, setRefused] = useState<string | null>(null)
+  const [merging, setMerging] = useState<string | null>(null)
+  const [mergeFailed, setMergeFailed] = useState<string | null>(null)
   const [loadingEarlier, setLoadingEarlier] = useState(false)
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const [newest] = useState(newestReads)
@@ -314,7 +322,6 @@ export const useTask = (threadId: string): TaskModel => {
   const arrived = useCallback(
     (items: ReadonlyArray<ThreadItem>) => {
       setSnapshot((current) => ({ ...current, items: mergeItems(current.items, items) }))
-      setStreaming((current) => caughtUp(current, items))
     },
     [setSnapshot],
   )
@@ -351,6 +358,10 @@ export const useTask = (threadId: string): TaskModel => {
     [client, cache, threadId, newest, readItems, fail],
   )
 
+  /** Whether its pull request at `url` has merged, as the runtime has it now. */
+  const landed = async (url: string) =>
+    (await client.getThread(threadId, { limit: 0 })).task.changes.some((change) => change.url === url && change.state === 'merged')
+
   const readFiles = useCallback(
     () =>
       void newest(
@@ -376,18 +387,8 @@ export const useTask = (threadId: string): TaskModel => {
   useWatch((event) => {
     // A command's output as far as it has come is useOutputs'; plan usage is the plan gauge's and the pickers'.
     if (event._tag === 'Output' || event._tag === 'PlanUsage') return
-    if (event._tag === 'Streaming') {
-      if (event.threadId !== threadId) return
-      setStreaming((current) =>
-        new Map(current).set(event.itemId, {
-          kind: event.kind,
-          agentId: event.agentId,
-          text: event.text,
-          at: current.get(event.itemId)?.at ?? new Date().toISOString(),
-        }),
-      )
-      return
-    }
+    // What its lead is still saying is useStreamed's.
+    if (event._tag === 'Streaming') return
     // What Althar runs of the project, whole each time: this task's, which the pill over the composer shows.
     if (event._tag === 'Launches')
       return void setSnapshot((current) =>
@@ -541,6 +542,8 @@ export const useTask = (threadId: string): TaskModel => {
     conflict,
     dismissConflict: () => setConflict(null),
     refused,
+    merging,
+    mergeRefused: error === null ? null : mergeFailed,
     pending,
     doing: acting,
     loadingEarlier,
@@ -686,9 +689,10 @@ export const useTask = (threadId: string): TaskModel => {
             (failure: unknown) => messageOf(failure),
           ),
     markAllReady: (urls) =>
-      onTask(async (taskId) => {
-        for (const url of urls) await client.markReady(taskId, url)
-      }),
+      act(async () => {
+        if (snapshot === null) return
+        for (const url of urls) await client.markReady(snapshot.task.id, url)
+      }, doing.markAllReady),
     openChange: () => act(async () => (snapshot === null ? undefined : client.openChange(snapshot.task.id)), doing.openChange),
     markDone: () => act(async () => (snapshot === null ? undefined : client.markTaskDone(snapshot.task.id)), doing.markDone),
     keep: () => act(async () => (snapshot === null ? undefined : client.keepTaskForLater(snapshot.task.id)), doing.keep),
@@ -717,8 +721,24 @@ export const useTask = (threadId: string): TaskModel => {
       }, doing.pushBranch),
     accept: (changes) =>
       act(async () => {
+        setMergeFailed(null)
         if (snapshot === null) return
-        for (const change of changes) await merge({ taskId: snapshot.task.id, head: change.head, url: change.url })
+        try {
+          for (const [at, change] of changes.entries()) {
+            setMerging(change.url)
+            try {
+              await merge({ taskId: snapshot.task.id, head: change.head, url: change.url })
+            } catch (failure) {
+              setMergeFailed(change.url)
+              throw failure
+            }
+            // The next builds on this one, so it merges only once this one has landed: not while its host's merge queue still
+            // holds it, nor while its host is still landing it. Pressed again, what is left merges from there.
+            if (at < changes.length - 1 && !(await landed(change.url))) return
+          }
+        } finally {
+          setMerging(null)
+        }
       }, doing.accept),
     push: (head, url) =>
       act(

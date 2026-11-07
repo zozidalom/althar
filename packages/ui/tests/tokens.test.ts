@@ -43,7 +43,7 @@ const dark = declarations(readFileSync(join(styles, 'dark.css'), 'utf8'), ":root
 
 /** What isn't a colour: stacking, radii, type, air, motion. */
 const NOT_COLOUR =
-  /^--(z-|r-|r$|font|mono|sp$|measure|ease|fast|base|slow|slide|fold|enter$|exit$|move$|press$|scale-|prose|lede|frost-blur$)/
+  /^--(z-|r-|r$|font|mono|sp$|measure|ease|fast|base|slow|slide|fold|enter$|exit$|stream-in$|move$|press$|scale-|prose|lede|frost-blur$)/
 
 /**
  * The same in every theme, so dark.css leaves them alone: what is drawn on
@@ -79,6 +79,13 @@ const SAME_IN_EVERY_THEME = new Set([
   '--mark-umber',
   '--paper-plain',
   '--bot',
+  // A desktop's own close colours (Windows' red, Ubuntu's orange) and the white on them, as that desktop keeps them in both schemes.
+  '--window-close',
+  '--window-close-yaru',
+  '--on-window-close',
+  '--window-close-soft',
+  '--window-close-soft-pressed',
+  '--on-window-close-soft',
 ])
 
 describe('the dark theme as a set of tokens', () => {
